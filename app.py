@@ -51,7 +51,7 @@ COMPLIANCE_RULES = [
     {'name': 'Insurance', 'description': 'State insurance commission requirements'}
 ]
 
-def wait_for_rate_limit(min_delay=4):
+def wait_for_rate_limit(min_delay=5):
     """Implement rate limiting to avoid 429 errors"""
     current_time = time.time()
     time_since_last = current_time - st.session_state.last_request_time
@@ -71,7 +71,7 @@ def configure_api(api_key):
         st.error(f"API Configuration Error: {str(e)}")
         return False
 
-def analyze_document(pdf_bytes, pdf_name, rules, max_retries=3):
+def analyze_document(pdf_bytes, pdf_name, rules, max_retries=2):
     """Analyze document with retry logic and exponential backoff"""
     
     for attempt in range(max_retries):
@@ -79,8 +79,8 @@ def analyze_document(pdf_bytes, pdf_name, rules, max_retries=3):
         uploaded_file = None
         
         try:
-            # Wait for rate limit (increased to 4 seconds)
-            wait_for_rate_limit(min_delay=4)
+            # Wait for rate limit (increased to 5 seconds)
+            wait_for_rate_limit(min_delay=5)
             
             # Configure model with lower temperature for more consistent JSON
             generation_config = {
@@ -119,16 +119,41 @@ Now analyze the document and return ONLY the JSON object:"""
                 tmp_file.write(pdf_bytes)
                 tmp_path = tmp_file.name
             
-            # Upload PDF to Gemini
-            uploaded_file = genai.upload_file(path=tmp_path, mime_type='application/pdf')
+            # Upload PDF to Gemini with retry
+            max_upload_retries = 3
+            uploaded_file = None
             
-            # Wait for file to be processed
-            wait_time = 3
-            for i in range(wait_time):
-                time.sleep(1)
-                file_status = genai.get_file(uploaded_file.name)
-                if file_status.state.name == "ACTIVE":
+            for upload_attempt in range(max_upload_retries):
+                try:
+                    uploaded_file = genai.upload_file(path=tmp_path, mime_type='application/pdf')
                     break
+                except Exception as upload_error:
+                    if upload_attempt < max_upload_retries - 1:
+                        time.sleep(2)
+                        continue
+                    else:
+                        raise upload_error
+            
+            if not uploaded_file:
+                raise Exception("Failed to upload file after retries")
+            
+            # Wait for file to be processed with timeout
+            max_wait = 30  # 30 seconds timeout
+            start_wait = time.time()
+            
+            while (time.time() - start_wait) < max_wait:
+                time.sleep(2)
+                try:
+                    file_status = genai.get_file(uploaded_file.name)
+                    if file_status.state.name == "ACTIVE":
+                        break
+                except:
+                    continue
+            
+            # Final check
+            file_status = genai.get_file(uploaded_file.name)
+            if file_status.state.name != "ACTIVE":
+                raise Exception(f"File not ready after {max_wait} seconds")
             
             # Generate content
             response = model.generate_content([prompt, uploaded_file])
@@ -221,13 +246,17 @@ Now analyze the document and return ONLY the JSON object:"""
                 return None
             
             # Handle file upload errors
-            elif "file" in error_msg and "upload" in error_msg:
+            elif "file" in error_msg and ("upload" in error_msg or "processing" in error_msg):
                 if attempt < max_retries - 1:
-                    st.warning(f"File upload error on attempt {attempt + 1}, retrying...")
-                    time.sleep(5)
+                    st.warning(f"File processing error on attempt {attempt + 1}, retrying in 10 seconds...")
+                    time.sleep(10)
                     continue
                 else:
-                    st.error(f"File upload failed: {str(e)}")
+                    st.error(f"File upload failed after {max_retries} attempts: {str(e)}")
+                    st.info("Try these solutions:")
+                    st.info("1. Ensure PDF is not corrupted")
+                    st.info("2. Try a smaller file size")
+                    st.info("3. Wait a minute and try again")
                     return None
             
             # Handle other errors
@@ -310,9 +339,9 @@ with st.sidebar:
     st.info("""
 **Rate Limit Tips:**
 - Free tier: 15 requests/min
-- App waits 4 seconds between requests
+- App waits 5 seconds between requests
 - Uses Gemini Flash 1.5 for efficiency
-- For large docs, analysis takes 2-5 minutes
+- For large docs, analysis takes 3-7 minutes
     """)
 
 # Main Content
