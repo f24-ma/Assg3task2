@@ -60,7 +60,7 @@ def configure_api(api_key):
         st.error(f"API Configuration Error: {str(e)}")
         return False
 
-def analyze_document_with_retry(pdf_data, rules, max_retries=3):
+def analyze_document_with_retry(pdf_bytes, pdf_name, rules, max_retries=3):
     """Analyze document with retry logic and exponential backoff"""
     
     for attempt in range(max_retries):
@@ -69,55 +69,90 @@ def analyze_document_with_retry(pdf_data, rules, max_retries=3):
             wait_for_rate_limit(min_delay=3)
             
             # Configure model with lower settings to reduce quota usage
-            model = genai.GenerativeModel('gemini-1.5-flash')  # Use flash for lower quota
+            model = genai.GenerativeModel('gemini-1.5-flash')
             
             # Create prompt
-            rules_text = "\n".join([f"- {rule['name']}: {rule['description']}" for rule in rules])
+            rules_text = "\n".join([f"{i+1}. {rule['name']}: {rule['description']}" for i, rule in enumerate(rules)])
             
-            prompt = f"""Analyze this document for compliance with the following rules:
+            prompt = f"""Analyze this PDF document for compliance with the following rules:
 
 {rules_text}
 
-For each rule, determine:
-1. Status: PASS, FAIL, or WARNING
-2. Brief explanation (1-2 sentences)
+IMPORTANT: You must provide a finding for EACH rule listed above.
 
-Return results in JSON format:
+For each rule, determine:
+- Status: PASS (compliant), FAIL (non-compliant), or WARNING (needs review)
+- Details: Brief explanation of your finding (1-2 sentences)
+
+Return your analysis in this EXACT JSON format:
 {{
   "findings": [
     {{
-      "rule": "Rule Name",
-      "status": "PASS/FAIL/WARNING",
-      "details": "Brief explanation"
+      "rule": "Data Privacy",
+      "status": "PASS",
+      "details": "Your explanation here"
     }}
   ]
-}}"""
+}}
+
+Analyze the document now and provide findings for all {len(rules)} rules."""
             
-            # Generate content with retry
-            response = model.generate_content([prompt, pdf_data])
+            # Save PDF to temporary file
+            import tempfile
+            import os
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', mode='wb') as tmp_file:
+                tmp_file.write(pdf_bytes)
+                tmp_path = tmp_file.name
+            
+            try:
+                # Upload the PDF file
+                uploaded_file = genai.upload_file(path=tmp_path, mime_type='application/pdf', display_name=pdf_name)
+                
+                # Generate content with the uploaded file
+                response = model.generate_content([prompt, uploaded_file])
+                
+                # Delete the uploaded file to save quota
+                uploaded_file.delete()
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
             
             # Parse response
             try:
                 # Extract JSON from response
-                text = response.text
-                if "```json" in text:
-                    text = text.split("```json")[1].split("```")[0]
-                elif "```" in text:
-                    text = text.split("```")[1].split("```")[0]
+                text = response.text.strip()
                 
-                result = json.loads(text.strip())
-                return result
-            except json.JSONDecodeError:
-                # If JSON parsing fails, return structured error
-                return {
-                    "findings": [
-                        {
-                            "rule": rule['name'],
-                            "status": "WARNING",
-                            "details": "Unable to parse API response"
-                        } for rule in rules
-                    ]
-                }
+                # Try to find JSON in various formats
+                if "```json" in text:
+                    text = text.split("```json")[1].split("```")[0].strip()
+                elif "```" in text:
+                    text = text.split("```")[1].split("```")[0].strip()
+                
+                result = json.loads(text)
+                
+                # Validate that we have findings
+                if 'findings' in result and len(result['findings']) > 0:
+                    return result
+                else:
+                    raise ValueError("No findings in response")
+                    
+            except (json.JSONDecodeError, ValueError) as e:
+                st.warning(f"JSON parsing issue on attempt {attempt + 1}: {str(e)}")
+                # If JSON parsing fails, try to extract meaningful info from text
+                if attempt == max_retries - 1:
+                    # Last attempt - return default findings
+                    return {
+                        "findings": [
+                            {
+                                "rule": rule['name'],
+                                "status": "WARNING",
+                                "details": "Analysis completed but results format was unclear. Manual review recommended."
+                            } for rule in rules
+                        ]
+                    }
+                continue
         
         except Exception as e:
             error_msg = str(e)
@@ -131,15 +166,22 @@ Return results in JSON format:
                     time.sleep(wait_time)
                     continue
                 else:
-                    st.error("⚠️ **API Quota Exceeded**")
-                    st.error("Solutions:")
-                    st.error("1. Wait a few minutes and try again")
-                    st.error("2. Check your quota at: https://ai.dev/usage")
-                    st.error("3. Get a new API key at: https://aistudio.google.com/apikey")
-                    st.error("4. Consider upgrading your plan for higher limits")
+                    st.error("API Quota Exceeded")
+                    st.info("Solutions:")
+                    st.info("1. Wait a few minutes and try again")
+                    st.info("2. Check your quota at: https://ai.dev/usage")
+                    st.info("3. Get a new API key at: https://aistudio.google.com/apikey")
+                    st.info("4. Consider upgrading your plan for higher limits")
                     return None
+            elif "api key not valid" in error_msg.lower() or "invalid api key" in error_msg.lower():
+                st.error("Invalid API Key")
+                st.info("Please check your API key and try again. Get a valid key at: https://aistudio.google.com/apikey")
+                return None
             else:
-                st.error(f"Error analyzing document: {error_msg}")
+                st.error(f"Error analyzing document (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
                 return None
     
     return None
@@ -271,10 +313,8 @@ if st.button("Run Compliance Audit", type="primary", use_container_width=True):
                 
                 # Analyze document
                 result = analyze_document_with_retry(
-                    {
-                        'mime_type': 'application/pdf',
-                        'data': pdf_bytes
-                    },
+                    pdf_bytes,
+                    uploaded_file.name,
                     selected_rules
                 )
                 
