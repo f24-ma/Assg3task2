@@ -1,9 +1,17 @@
 import streamlit as st
 import time
 import json
+import os
+import tempfile
 from datetime import datetime
-import google.generativeai as genai
-from pathlib import Path
+
+# Only import if API key is provided
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
+    st.error("google-generativeai not installed. Run: pip install google-generativeai")
 
 # Page configuration
 st.set_page_config(
@@ -18,8 +26,8 @@ if 'results' not in st.session_state:
     st.session_state.results = None
 if 'last_request_time' not in st.session_state:
     st.session_state.last_request_time = 0
-if 'request_count' not in st.session_state:
-    st.session_state.request_count = 0
+if 'processing' not in st.session_state:
+    st.session_state.processing = False
 
 # Compliance rules
 COMPLIANCE_RULES = [
@@ -40,7 +48,7 @@ COMPLIANCE_RULES = [
     {'name': 'Insurance', 'description': 'State insurance commission requirements'}
 ]
 
-def wait_for_rate_limit(min_delay=2):
+def wait_for_rate_limit(min_delay=3):
     """Implement rate limiting to avoid 429 errors"""
     current_time = time.time()
     time_since_last = current_time - st.session_state.last_request_time
@@ -60,129 +68,140 @@ def configure_api(api_key):
         st.error(f"API Configuration Error: {str(e)}")
         return False
 
-def analyze_document_with_retry(pdf_bytes, pdf_name, rules, max_retries=3):
+def analyze_document(pdf_bytes, pdf_name, rules, max_retries=3):
     """Analyze document with retry logic and exponential backoff"""
     
     for attempt in range(max_retries):
+        tmp_path = None
+        uploaded_file = None
+        
         try:
             # Wait for rate limit
             wait_for_rate_limit(min_delay=3)
             
-            # Configure model with lower settings to reduce quota usage
+            # Configure model
             model = genai.GenerativeModel('gemini-1.5-flash')
             
             # Create prompt
             rules_text = "\n".join([f"{i+1}. {rule['name']}: {rule['description']}" for i, rule in enumerate(rules)])
             
-            prompt = f"""Analyze this PDF document for compliance with the following rules:
+            prompt = f"""Analyze this PDF document for compliance with these {len(rules)} rules:
 
 {rules_text}
 
-IMPORTANT: You must provide a finding for EACH rule listed above.
+For EACH rule above, provide:
+- Status: PASS, FAIL, or WARNING
+- Details: Brief explanation (1-2 sentences)
 
-For each rule, determine:
-- Status: PASS (compliant), FAIL (non-compliant), or WARNING (needs review)
-- Details: Brief explanation of your finding (1-2 sentences)
-
-Return your analysis in this EXACT JSON format:
+Return ONLY valid JSON in this format (no markdown, no code blocks):
 {{
   "findings": [
-    {{
-      "rule": "Data Privacy",
-      "status": "PASS",
-      "details": "Your explanation here"
-    }}
+    {{"rule": "Data Privacy", "status": "PASS", "details": "Explanation here"}},
+    {{"rule": "Financial Reporting", "status": "WARNING", "details": "Explanation here"}}
   ]
-}}
-
-Analyze the document now and provide findings for all {len(rules)} rules."""
+}}"""
             
             # Save PDF to temporary file
-            import tempfile
-            import os
-            
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', mode='wb') as tmp_file:
                 tmp_file.write(pdf_bytes)
                 tmp_path = tmp_file.name
             
-            try:
-                # Upload the PDF file
-                uploaded_file = genai.upload_file(path=tmp_path, mime_type='application/pdf', display_name=pdf_name)
-                
-                # Generate content with the uploaded file
-                response = model.generate_content([prompt, uploaded_file])
-                
-                # Delete the uploaded file to save quota
-                uploaded_file.delete()
-            finally:
-                # Clean up temp file
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
+            # Upload PDF to Gemini
+            uploaded_file = genai.upload_file(path=tmp_path, mime_type='application/pdf')
+            
+            # Wait for file to be processed
+            time.sleep(2)
+            
+            # Generate content
+            response = model.generate_content([prompt, uploaded_file])
             
             # Parse response
-            try:
-                # Extract JSON from response
-                text = response.text.strip()
+            text = response.text.strip()
+            
+            # Remove markdown code blocks if present
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0].strip()
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0].strip()
+            
+            result = json.loads(text)
+            
+            # Validate response
+            if 'findings' in result and len(result['findings']) > 0:
+                # Clean up
+                if uploaded_file:
+                    uploaded_file.delete()
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
                 
-                # Try to find JSON in various formats
-                if "```json" in text:
-                    text = text.split("```json")[1].split("```")[0].strip()
-                elif "```" in text:
-                    text = text.split("```")[1].split("```")[0].strip()
-                
-                result = json.loads(text)
-                
-                # Validate that we have findings
-                if 'findings' in result and len(result['findings']) > 0:
-                    return result
-                else:
-                    raise ValueError("No findings in response")
-                    
-            except (json.JSONDecodeError, ValueError) as e:
-                st.warning(f"JSON parsing issue on attempt {attempt + 1}: {str(e)}")
-                # If JSON parsing fails, try to extract meaningful info from text
-                if attempt == max_retries - 1:
-                    # Last attempt - return default findings
-                    return {
-                        "findings": [
-                            {
-                                "rule": rule['name'],
-                                "status": "WARNING",
-                                "details": "Analysis completed but results format was unclear. Manual review recommended."
-                            } for rule in rules
-                        ]
-                    }
-                continue
+                return result
+            else:
+                raise ValueError("No findings in response")
+        
+        except json.JSONDecodeError as e:
+            if attempt == max_retries - 1:
+                st.error(f"Failed to parse API response after {max_retries} attempts")
+                # Return fallback results
+                return {
+                    "findings": [
+                        {
+                            "rule": rule['name'],
+                            "status": "WARNING",
+                            "details": "Analysis completed but response format was unclear. Manual review recommended."
+                        } for rule in rules
+                    ]
+                }
+            else:
+                st.warning(f"JSON parsing error on attempt {attempt + 1}, retrying...")
+                time.sleep(2)
         
         except Exception as e:
-            error_msg = str(e)
+            error_msg = str(e).lower()
             
-            # Handle specific errors
-            if "429" in error_msg or "quota" in error_msg.lower():
+            # Handle quota/rate limit errors
+            if "429" in str(e) or "quota" in error_msg or "rate" in error_msg:
                 if attempt < max_retries - 1:
-                    # Exponential backoff
                     wait_time = (2 ** attempt) * 5
-                    st.warning(f"Rate limit hit. Waiting {wait_time} seconds before retry {attempt + 2}/{max_retries}...")
+                    st.warning(f"Rate limit hit. Waiting {wait_time} seconds... (retry {attempt + 2}/{max_retries})")
                     time.sleep(wait_time)
                     continue
                 else:
                     st.error("API Quota Exceeded")
                     st.info("Solutions:")
                     st.info("1. Wait a few minutes and try again")
-                    st.info("2. Check your quota at: https://ai.dev/usage")
-                    st.info("3. Get a new API key at: https://aistudio.google.com/apikey")
-                    st.info("4. Consider upgrading your plan for higher limits")
+                    st.info("2. Check your quota: https://ai.dev/usage")
+                    st.info("3. Get a new API key: https://aistudio.google.com/apikey")
                     return None
-            elif "api key not valid" in error_msg.lower() or "invalid api key" in error_msg.lower():
+            
+            # Handle invalid API key
+            elif "api key" in error_msg or "invalid" in error_msg:
                 st.error("Invalid API Key")
-                st.info("Please check your API key and try again. Get a valid key at: https://aistudio.google.com/apikey")
+                st.info("Please check your API key at: https://aistudio.google.com/apikey")
                 return None
+            
+            # Handle other errors
             else:
-                st.error(f"Error analyzing document (attempt {attempt + 1}/{max_retries}): {error_msg}")
                 if attempt < max_retries - 1:
+                    st.warning(f"Error on attempt {attempt + 1}: {str(e)}")
                     time.sleep(2)
                     continue
-                return None
+                else:
+                    st.error(f"Analysis failed: {str(e)}")
+                    return None
+        
+        finally:
+            # Always clean up resources
+            try:
+                if uploaded_file:
+                    uploaded_file.delete()
+            except:
+                pass
+            
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except:
+                pass
     
     return None
 
@@ -204,7 +223,7 @@ with st.sidebar:
     
     if api_key_input != st.session_state.api_key:
         st.session_state.api_key = api_key_input
-        if api_key_input:
+        if api_key_input and GENAI_AVAILABLE:
             if configure_api(api_key_input):
                 st.success("API Key configured")
     
@@ -212,39 +231,35 @@ with st.sidebar:
     
     # Rule Selection
     st.subheader("Compliance Rules")
+    
+    # Select all checkbox
+    select_all = st.checkbox("Select All Rules", value=True)
+    
     selected_rules = []
     
-    with st.expander("Select Rules to Check", expanded=True):
-        # Select all checkbox
-        select_all = st.checkbox("Select All", value=True)
-        
+    with st.expander("View/Edit Rules", expanded=False):
         for rule in COMPLIANCE_RULES:
-            if select_all:
-                checked = st.checkbox(
-                    rule['name'],
-                    value=True,
-                    key=rule['name'],
-                    help=rule['description']
-                )
-            else:
-                checked = st.checkbox(
-                    rule['name'],
-                    value=False,
-                    key=rule['name'],
-                    help=rule['description']
-                )
+            checked = st.checkbox(
+                rule['name'],
+                value=select_all,
+                key=f"rule_{rule['name']}",
+                help=rule['description']
+            )
             
             if checked:
                 selected_rules.append(rule)
+    
+    if select_all:
+        selected_rules = COMPLIANCE_RULES.copy()
     
     st.markdown("---")
     
     # Rate Limit Info
     st.info("""
-    **Rate Limit Tips:**
-    - Free tier: ~15 requests/min
-    - App waits 3 seconds between requests
-    - Uses Gemini Flash for lower quota usage
+**Rate Limit Tips:**
+- Free tier: ~15 requests/min
+- App waits 3 seconds between requests
+- Uses Gemini Flash for lower quota usage
     """)
 
 # Main Content
@@ -258,7 +273,8 @@ with col2:
         "Upload PDF Documents",
         type=['pdf'],
         accept_multiple_files=True,
-        help="Maximum 200MB per file"
+        help="Maximum 200MB per file",
+        key="pdf_uploader"
     )
     docs_count = len(uploaded_files) if uploaded_files else 0
     st.metric("Documents", docs_count)
@@ -279,31 +295,57 @@ with col4:
 
 st.markdown("---")
 
-# Run Audit Button
-if st.button("Run Compliance Audit", type="primary", use_container_width=True):
+# Run Audit Button - Centered and prominent
+col_left, col_center, col_right = st.columns([1, 2, 1])
+
+with col_center:
+    audit_button = st.button(
+        "Run Compliance Audit", 
+        type="primary", 
+        use_container_width=True,
+        disabled=st.session_state.processing
+    )
+
+st.markdown("---")
+
+# Process audit
+if audit_button:
     
     # Validation
+    if not GENAI_AVAILABLE:
+        st.error("Google Generative AI library not available")
+        st.stop()
+    
     if not st.session_state.api_key:
         st.error("Please enter your Google API Key in the sidebar")
         st.info("Get your free API key at: https://aistudio.google.com/apikey")
-    elif not uploaded_files:
+        st.stop()
+    
+    if not uploaded_files:
         st.error("Please upload at least one PDF document")
-    elif not selected_rules:
+        st.stop()
+    
+    if not selected_rules:
         st.error("Please select at least one compliance rule")
-    else:
-        # Configure API
-        if not configure_api(st.session_state.api_key):
-            st.stop()
-        
-        # Process documents
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        all_results = []
-        total_passed = 0
-        total_failed = 0
-        total_warnings = 0
-        
+        st.stop()
+    
+    # Configure API
+    if not configure_api(st.session_state.api_key):
+        st.stop()
+    
+    # Set processing flag
+    st.session_state.processing = True
+    
+    # Process documents
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    all_results = []
+    total_passed = 0
+    total_failed = 0
+    total_warnings = 0
+    
+    try:
         for idx, uploaded_file in enumerate(uploaded_files):
             status_text.text(f"Analyzing {uploaded_file.name}... ({idx + 1}/{len(uploaded_files)})")
             
@@ -312,7 +354,7 @@ if st.button("Run Compliance Audit", type="primary", use_container_width=True):
                 pdf_bytes = uploaded_file.read()
                 
                 # Analyze document
-                result = analyze_document_with_retry(
+                result = analyze_document(
                     pdf_bytes,
                     uploaded_file.name,
                     selected_rules
@@ -321,9 +363,10 @@ if st.button("Run Compliance Audit", type="primary", use_container_width=True):
                 if result and 'findings' in result:
                     # Count statuses
                     for finding in result['findings']:
-                        if finding['status'] == 'PASS':
+                        status = finding.get('status', 'WARNING').upper()
+                        if status == 'PASS':
                             total_passed += 1
-                        elif finding['status'] == 'FAIL':
+                        elif status == 'FAIL':
                             total_failed += 1
                         else:
                             total_warnings += 1
@@ -357,6 +400,10 @@ if st.button("Run Compliance Audit", type="primary", use_container_width=True):
         }
         
         st.success(f"Analysis complete! Compliance Rate: {compliance_rate}%")
+        
+    finally:
+        st.session_state.processing = False
+        time.sleep(1)
         st.rerun()
 
 # Display Results
@@ -370,17 +417,18 @@ if st.session_state.results:
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.metric("Passed", results['passed'], delta=None)
+        st.metric("Passed", results['passed'])
     
     with col2:
-        st.metric("Warnings", results['warnings'], delta=None)
+        st.metric("Warnings", results['warnings'])
     
     with col3:
-        st.metric("Failed", results['failed'], delta=None)
+        st.metric("Failed", results['failed'])
     
     # Compliance rate bar
     st.subheader("Overall Compliance")
     st.progress(results['compliance_rate'] / 100)
+    st.write(f"**{results['compliance_rate']}%** compliant")
     
     # Document results
     st.subheader("Document Details")
@@ -388,24 +436,29 @@ if st.session_state.results:
     for doc_result in results['document_results']:
         with st.expander(f"{doc_result['document_name']}", expanded=True):
             for finding in doc_result['findings']:
-                status = finding['status']
+                status = finding.get('status', 'WARNING').upper()
+                rule = finding.get('rule', 'Unknown Rule')
+                details = finding.get('details', 'No details provided')
                 
                 if status == 'PASS':
-                    st.success(f"**{finding['rule']}**: {finding['details']}")
+                    st.success(f"**{rule}**: {details}")
                 elif status == 'FAIL':
-                    st.error(f"**{finding['rule']}**: {finding['details']}")
+                    st.error(f"**{rule}**: {details}")
                 else:
-                    st.warning(f"**{finding['rule']}**: {finding['details']}")
+                    st.warning(f"**{rule}**: {details}")
     
     # Export results
     st.markdown("---")
-    if st.button("Export Results as JSON"):
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col2:
         results_json = json.dumps(results, indent=2)
         st.download_button(
-            label="Download JSON",
+            label="Export Results as JSON",
             data=results_json,
             file_name=f"compliance_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json"
+            mime="application/json",
+            use_container_width=True
         )
 
 else:
@@ -414,4 +467,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.caption("Compliance Checker v1.0 | Powered by Google Gemini")
+st.caption(f"Compliance Checker v1.0 | Powered by Google Gemini | Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
