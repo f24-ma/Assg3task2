@@ -295,15 +295,45 @@ with col4:
 
 st.markdown("---")
 
-# Run Audit Button - Centered and prominent
-col_left, col_center, col_right = st.columns([1, 2, 1])
+# Status Check
+api_configured = bool(st.session_state.api_key)
+docs_uploaded = bool(uploaded_files)
+rules_selected = bool(selected_rules)
 
-with col_center:
+col_status1, col_status2, col_status3 = st.columns(3)
+
+with col_status1:
+    if api_configured:
+        st.success("API Key Configured")
+    else:
+        st.error("API Key Missing")
+
+with col_status2:
+    if docs_uploaded:
+        st.success(f"{docs_count} Document(s) Uploaded")
+    else:
+        st.error("No Documents")
+
+with col_status3:
+    if rules_selected:
+        st.success(f"{len(selected_rules)} Rules Selected")
+    else:
+        st.error("No Rules Selected")
+
+st.markdown("---")
+
+# Run Audit Button - Large and prominent
+st.markdown("### Ready to Analyze")
+
+if st.session_state.processing:
+    st.warning("Analysis in progress... Please wait.")
+    audit_button = False
+else:
     audit_button = st.button(
         "Run Compliance Audit", 
         type="primary", 
         use_container_width=True,
-        disabled=st.session_state.processing
+        help="Click to start analyzing your documents"
     )
 
 st.markdown("---")
@@ -462,8 +492,19 @@ if st.session_state.results:
         )
 
 else:
-    # Empty state
-    st.info("Upload documents and click 'Run Compliance Audit' to get started")
+    # Empty state with instructions
+    st.markdown("---")
+    st.info("Getting Started")
+    st.markdown("""
+    **Follow these steps to analyze your documents:**
+    
+    1. **Enter API Key** - Add your Google API key in the left sidebar
+    2. **Upload PDF** - You have already uploaded: TubeMediaCorp document
+    3. **Select Rules** - 15 compliance rules are selected
+    4. **Click the button above** - Click "Run Compliance Audit" to start
+    
+    **Need an API key?** Get one free at: https://aistudio.google.com/apikey
+    """)
 
 # Footer
 st.markdown("---")
