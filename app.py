@@ -1,7 +1,10 @@
+# Disable ChromaDB telemetry FIRST (before any other imports)
+import os
+os.environ['ANONYMIZED_TELEMETRY'] = 'False'
+
 import streamlit as st
 import time
 import json
-import os
 import tempfile
 from datetime import datetime
 
@@ -48,7 +51,7 @@ COMPLIANCE_RULES = [
     {'name': 'Insurance', 'description': 'State insurance commission requirements'}
 ]
 
-def wait_for_rate_limit(min_delay=3):
+def wait_for_rate_limit(min_delay=4):
     """Implement rate limiting to avoid 429 errors"""
     current_time = time.time()
     time_since_last = current_time - st.session_state.last_request_time
@@ -76,30 +79,40 @@ def analyze_document(pdf_bytes, pdf_name, rules, max_retries=3):
         uploaded_file = None
         
         try:
-            # Wait for rate limit
-            wait_for_rate_limit(min_delay=3)
+            # Wait for rate limit (increased to 4 seconds)
+            wait_for_rate_limit(min_delay=4)
             
-            # Configure model
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            # Configure model with lower temperature for more consistent JSON
+            generation_config = {
+                "temperature": 0.1,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": 8192,
+            }
             
-            # Create prompt
+            model = genai.GenerativeModel(
+                'gemini-1.5-flash',
+                generation_config=generation_config
+            )
+            
+            # Create prompt with strict JSON formatting instructions
             rules_text = "\n".join([f"{i+1}. {rule['name']}: {rule['description']}" for i, rule in enumerate(rules)])
             
-            prompt = f"""Analyze this PDF document for compliance with these {len(rules)} rules:
+            prompt = f"""You are a compliance analyzer. Analyze this PDF document for compliance with these {len(rules)} rules:
 
 {rules_text}
 
-For EACH rule above, provide:
-- Status: PASS, FAIL, or WARNING
-- Details: Brief explanation (1-2 sentences)
+CRITICAL: You must respond with ONLY a valid JSON object. No explanations, no markdown, no code blocks.
 
-Return ONLY valid JSON in this format (no markdown, no code blocks):
-{{
-  "findings": [
-    {{"rule": "Data Privacy", "status": "PASS", "details": "Explanation here"}},
-    {{"rule": "Financial Reporting", "status": "WARNING", "details": "Explanation here"}}
-  ]
-}}"""
+For EACH rule above, provide a finding with:
+- rule: exact rule name from the list
+- status: must be exactly "PASS", "FAIL", or "WARNING"
+- details: brief explanation (1-2 sentences)
+
+Example format:
+{{"findings": [{{"rule": "Data Privacy", "status": "PASS", "details": "Document complies with GDPR requirements."}}]}}
+
+Now analyze the document and return ONLY the JSON object:"""
             
             # Save PDF to temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf', mode='wb') as tmp_file:
@@ -110,7 +123,12 @@ Return ONLY valid JSON in this format (no markdown, no code blocks):
             uploaded_file = genai.upload_file(path=tmp_path, mime_type='application/pdf')
             
             # Wait for file to be processed
-            time.sleep(2)
+            wait_time = 3
+            for i in range(wait_time):
+                time.sleep(1)
+                file_status = genai.get_file(uploaded_file.name)
+                if file_status.state.name == "ACTIVE":
+                    break
             
             # Generate content
             response = model.generate_content([prompt, uploaded_file])
@@ -118,29 +136,52 @@ Return ONLY valid JSON in this format (no markdown, no code blocks):
             # Parse response
             text = response.text.strip()
             
-            # Remove markdown code blocks if present
+            # Clean up response - remove any markdown formatting
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:
                 text = text.split("```")[1].split("```")[0].strip()
             
+            # Remove any leading/trailing text that isn't JSON
+            if text.startswith('{'):
+                text = '{' + text.split('{', 1)[1]
+            if text.endswith('}'):
+                text = text.rsplit('}', 1)[0] + '}'
+            
             result = json.loads(text)
             
-            # Validate response
-            if 'findings' in result and len(result['findings']) > 0:
-                # Clean up
-                if uploaded_file:
-                    uploaded_file.delete()
-                if tmp_path and os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-                
-                return result
-            else:
+            # Validate response structure
+            if 'findings' not in result:
+                raise ValueError("Response missing 'findings' key")
+            
+            if not isinstance(result['findings'], list):
+                raise ValueError("'findings' must be a list")
+            
+            if len(result['findings']) == 0:
                 raise ValueError("No findings in response")
+            
+            # Validate each finding
+            for finding in result['findings']:
+                if 'rule' not in finding or 'status' not in finding or 'details' not in finding:
+                    raise ValueError("Finding missing required fields")
+                if finding['status'] not in ['PASS', 'FAIL', 'WARNING']:
+                    finding['status'] = 'WARNING'  # Fix invalid status
+            
+            # Clean up
+            try:
+                genai.delete_file(uploaded_file.name)
+            except:
+                pass
+            
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            
+            return result
         
         except json.JSONDecodeError as e:
             if attempt == max_retries - 1:
                 st.error(f"Failed to parse API response after {max_retries} attempts")
+                st.error(f"Error: {str(e)}")
                 # Return fallback results
                 return {
                     "findings": [
@@ -153,37 +194,47 @@ Return ONLY valid JSON in this format (no markdown, no code blocks):
                 }
             else:
                 st.warning(f"JSON parsing error on attempt {attempt + 1}, retrying...")
-                time.sleep(2)
+                time.sleep(3)
         
         except Exception as e:
             error_msg = str(e).lower()
             
             # Handle quota/rate limit errors
-            if "429" in str(e) or "quota" in error_msg or "rate" in error_msg:
+            if "429" in str(e) or "quota" in error_msg or "rate limit" in error_msg or "resource exhausted" in error_msg:
                 if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) * 5
+                    wait_time = (2 ** attempt) * 10  # Increased backoff
                     st.warning(f"Rate limit hit. Waiting {wait_time} seconds... (retry {attempt + 2}/{max_retries})")
                     time.sleep(wait_time)
                     continue
                 else:
                     st.error("API Quota Exceeded")
-                    st.info("Solutions:")
-                    st.info("1. Wait a few minutes and try again")
-                    st.info("2. Check your quota: https://ai.dev/usage")
+                    st.info("**Solutions:**")
+                    st.info("1. Wait 1 minute and try again")
+                    st.info("2. Check your quota: https://aistudio.google.com/app/apikey")
                     st.info("3. Get a new API key: https://aistudio.google.com/apikey")
                     return None
             
             # Handle invalid API key
-            elif "api key" in error_msg or "invalid" in error_msg:
+            elif "api key" in error_msg or "invalid" in error_msg or "authentication" in error_msg:
                 st.error("Invalid API Key")
-                st.info("Please check your API key at: https://aistudio.google.com/apikey")
+                st.info("Get your API key at: https://aistudio.google.com/apikey")
                 return None
+            
+            # Handle file upload errors
+            elif "file" in error_msg and "upload" in error_msg:
+                if attempt < max_retries - 1:
+                    st.warning(f"File upload error on attempt {attempt + 1}, retrying...")
+                    time.sleep(5)
+                    continue
+                else:
+                    st.error(f"File upload failed: {str(e)}")
+                    return None
             
             # Handle other errors
             else:
                 if attempt < max_retries - 1:
                     st.warning(f"Error on attempt {attempt + 1}: {str(e)}")
-                    time.sleep(2)
+                    time.sleep(5)
                     continue
                 else:
                     st.error(f"Analysis failed: {str(e)}")
@@ -193,7 +244,7 @@ Return ONLY valid JSON in this format (no markdown, no code blocks):
             # Always clean up resources
             try:
                 if uploaded_file:
-                    uploaded_file.delete()
+                    genai.delete_file(uploaded_file.name)
             except:
                 pass
             
@@ -218,7 +269,8 @@ with st.sidebar:
         "Google API Key",
         type="password",
         value=st.session_state.api_key,
-        help="Get your API key from https://aistudio.google.com/apikey"
+        help="Get your API key from https://aistudio.google.com/apikey",
+        placeholder="Enter your API key here"
     )
     
     if api_key_input != st.session_state.api_key:
@@ -257,9 +309,10 @@ with st.sidebar:
     # Rate Limit Info
     st.info("""
 **Rate Limit Tips:**
-- Free tier: ~15 requests/min
-- App waits 3 seconds between requests
-- Uses Gemini Flash for lower quota usage
+- Free tier: 15 requests/min
+- App waits 4 seconds between requests
+- Uses Gemini Flash 1.5 for efficiency
+- For large docs, analysis takes 2-5 minutes
     """)
 
 # Main Content
@@ -284,14 +337,14 @@ with col3:
         compliance_rate = st.session_state.results.get('compliance_rate', 0)
         st.metric("Compliance Rate", f"{compliance_rate}%")
     else:
-        st.metric("Compliance Rate", "--")
+        st.metric("Compliance Rate", "0%")
 
 with col4:
     if st.session_state.results:
         issues = st.session_state.results.get('failed', 0)
         st.metric("Issues", issues)
     else:
-        st.metric("Issues", "--")
+        st.metric("Issues", "0")
 
 st.markdown("---")
 
@@ -306,19 +359,19 @@ with col_status1:
     if api_configured:
         st.success("API Key Configured")
     else:
-        st.error("API Key Missing")
+        st.warning("API Key Missing")
 
 with col_status2:
     if docs_uploaded:
         st.success(f"{docs_count} Document(s) Uploaded")
     else:
-        st.error("No Documents")
+        st.warning("No Documents Uploaded")
 
 with col_status3:
     if rules_selected:
         st.success(f"{len(selected_rules)} Rules Selected")
     else:
-        st.error("No Rules Selected")
+        st.warning("No Rules Selected")
 
 st.markdown("---")
 
@@ -333,7 +386,8 @@ else:
         "Run Compliance Audit", 
         type="primary", 
         use_container_width=True,
-        help="Click to start analyzing your documents"
+        help="Click to start analyzing your documents",
+        disabled=not (api_configured and docs_uploaded and rules_selected)
     )
 
 st.markdown("---")
@@ -447,13 +501,13 @@ if st.session_state.results:
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.metric("Passed", results['passed'])
+        st.metric("Passed", results['passed'], delta=None)
     
     with col2:
-        st.metric("Warnings", results['warnings'])
+        st.metric("Warnings", results['warnings'], delta=None)
     
     with col3:
-        st.metric("Failed", results['failed'])
+        st.metric("Failed", results['failed'], delta=None)
     
     # Compliance rate bar
     st.subheader("Overall Compliance")
@@ -479,17 +533,15 @@ if st.session_state.results:
     
     # Export results
     st.markdown("---")
-    col1, col2, col3 = st.columns([1, 1, 1])
     
-    with col2:
-        results_json = json.dumps(results, indent=2)
-        st.download_button(
-            label="Export Results as JSON",
-            data=results_json,
-            file_name=f"compliance_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json",
-            use_container_width=True
-        )
+    results_json = json.dumps(results, indent=2)
+    st.download_button(
+        label="Export Results as JSON",
+        data=results_json,
+        file_name=f"compliance_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json",
+        use_container_width=True
+    )
 
 else:
     # Empty state with instructions
@@ -499,13 +551,17 @@ else:
     **Follow these steps to analyze your documents:**
     
     1. **Enter API Key** - Add your Google API key in the left sidebar
-    2. **Upload PDF** - You have already uploaded: TubeMediaCorp document
-    3. **Select Rules** - 15 compliance rules are selected
-    4. **Click the button above** - Click "Run Compliance Audit" to start
+       - Get one free at: https://aistudio.google.com/apikey
     
-    **Need an API key?** Get one free at: https://aistudio.google.com/apikey
+    2. **Upload PDF** - Click "Browse files" above to upload your document(s)
+    
+    3. **Select Rules** - Choose which compliance rules to check (15 available)
+    
+    4. **Run Analysis** - Click "Run Compliance Audit" button above
+    
+    **Note:** Analysis typically takes 2-5 minutes depending on document size.
     """)
 
 # Footer
 st.markdown("---")
-st.caption(f"Compliance Checker v1.0 | Powered by Google Gemini | Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Compliance Checker v1.0 | Powered by Google Gemini 1.5 Flash | Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
